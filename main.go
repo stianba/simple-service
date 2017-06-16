@@ -6,18 +6,17 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 
-	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
+	"github.com/stianba/auth-service/token"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
 
-const dbName string = "electricians-service"
+const collection string = "electricians"
 
 type electrician struct {
-	ID      bson.ObjectId `json:"id" bson:"_id,omitempty"`
+	ID      bson.ObjectId `json:"_id" bson:"_id,omitempty"`
 	Name    string        `json:"name"`
 	Address string        `json:"address"`
 }
@@ -36,38 +35,20 @@ func responseWithJSON(w http.ResponseWriter, json []byte, code int) {
 
 func isAuthenticated(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var token string
+		authHeader, ok := r.Header["Authorization"]
 
-		tokens, ok := r.Header["Authorization"]
+		if ok {
+			persistentData, err := token.FromHeader(authHeader)
 
-		if ok && len(tokens) >= 1 {
-			token = tokens[0]
-			token = strings.TrimPrefix(token, "Bearer ")
-		}
-
-		if token == "" {
-			errorWithJSON(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-			return
-		}
-
-		parsedToken, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				msg := fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
-				return nil, msg
+			if err != nil {
+				errorWithJSON(w, err.Error(), http.StatusBadRequest)
+				return
 			}
 
-			return []byte(os.Getenv("JWT_SIGNER_SECRET")), nil
-		})
-
-		if err != nil {
-			errorWithJSON(w, "Invalid token.", http.StatusUnauthorized)
-			return
-		}
-
-		if parsedToken != nil && parsedToken.Valid {
-			next.ServeHTTP(w, r)
+			ctx := token.ToContext(persistentData, r)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		} else {
-			errorWithJSON(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			errorWithJSON(w, "No auth header found", http.StatusBadRequest)
 		}
 	})
 }
@@ -79,12 +60,12 @@ func listAll(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 
 		var electricians []electrician
 
-		c := session.DB(dbName).C("electricians")
+		c := session.DB(os.Getenv("DB_NAME")).C(collection)
 		err := c.Find(bson.M{}).All(&electricians)
 
 		if err != nil {
 			errorWithJSON(w, "Database error", http.StatusInternalServerError)
-			log.Println("Failed get all books: ", err)
+			log.Println("Failed get all electricians: ", err)
 			return
 		}
 
@@ -113,12 +94,12 @@ func create(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		c := session.DB(dbName).C("electricians")
+		c := session.DB(os.Getenv("DB_NAME")).C(collection)
 		err = c.Insert(electrician)
 
 		if err != nil {
 			errorWithJSON(w, "Database error", http.StatusInternalServerError)
-			log.Println("Failed insert book: ", err)
+			log.Println("Failed insert electrician: ", err)
 			return
 		}
 
@@ -128,7 +109,7 @@ func create(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	session, err := mgo.Dial("localhost")
+	session, err := mgo.Dial(fmt.Sprintf("mongodb://%v:%v@%v/%v", os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_HOST"), os.Getenv("DB_NAME")))
 
 	if err != nil {
 		panic(err)
@@ -137,8 +118,14 @@ func main() {
 	defer session.Close()
 	session.SetMode(mgo.Monotonic, true)
 
+	port := os.Getenv("PORT")
+
+	if port == "" {
+		port = "1338"
+	}
+
 	router := mux.NewRouter()
 	router.HandleFunc("/", listAll(session)).Methods("GET")
 	router.Handle("/", isAuthenticated(http.HandlerFunc(create(session)))).Methods("POST")
-	http.ListenAndServe(":1337", router)
+	http.ListenAndServe(":"+port, router)
 }
