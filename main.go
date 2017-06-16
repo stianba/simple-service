@@ -108,6 +108,32 @@ func create(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func delete(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := s.Copy()
+		defer session.Close()
+
+		vars := mux.Vars(r)
+		id := vars["id"]
+
+		c := session.DB(os.Getenv("DB_NAME")).C(collection)
+		err := c.RemoveId(bson.ObjectIdHex(id))
+
+		if err != nil {
+			switch err {
+			default:
+				errorWithJSON(w, "Database error", http.StatusInternalServerError)
+				return
+			case mgo.ErrNotFound:
+				errorWithJSON(w, "Electrician not found", http.StatusNotFound)
+				return
+			}
+		}
+
+		responseWithJSON(w, []byte(fmt.Sprint("{\"message\":\"electrician_deleted\"}")), http.StatusOK)
+	}
+}
+
 func main() {
 	session, err := mgo.Dial(fmt.Sprintf("mongodb://%v:%v@%v/%v", os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_HOST"), os.Getenv("DB_NAME")))
 
@@ -127,5 +153,6 @@ func main() {
 	router := mux.NewRouter()
 	router.HandleFunc("/", listAll(session)).Methods("GET")
 	router.Handle("/", isAuthenticated(http.HandlerFunc(create(session)))).Methods("POST")
+	router.Handle("/{id}", isAuthenticated(http.HandlerFunc(delete(session)))).Methods("DELETE")
 	http.ListenAndServe(":"+port, router)
 }
