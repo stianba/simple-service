@@ -121,7 +121,7 @@ func listAll(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 		var electricians []electrician
 
 		c := session.DB(os.Getenv("DB_NAME")).C(collection)
-		err := c.Find(bson.M{}).All(&electricians)
+		err := c.Find(bson.M{}).Sort("name").Limit(10).All(&electricians)
 
 		if err != nil {
 			errorWithJSON(w, "Database error", http.StatusInternalServerError)
@@ -239,8 +239,6 @@ func search(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 		skip := bson.M{"$skip": params.Skip}
 		limit := bson.M{"$limit": params.Limit}
 		pipes = append(pipes, skip, limit)
-
-		fmt.Println(pipes)
 
 		c := session.DB(os.Getenv("DB_NAME")).C(collection)
 		c.Pipe(pipes).All(&electricians)
