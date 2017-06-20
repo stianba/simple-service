@@ -146,8 +146,8 @@ func search(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 
 		var electricians []electrician
 
-		query := make(bson.M, 0)
-		params := searchParams{Skip: 0, Limit: 10, LocationScope: 90000}
+		pipes := make([]bson.M, 0)
+		params := searchParams{Skip: 0, Limit: 10, LocationScope: 3000}
 		queries := r.URL.Query()
 
 		skipQuery, ok := queries["skip"]
@@ -167,7 +167,7 @@ func search(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 		limitQuery, ok := queries["limit"]
 
 		if ok {
-			if len(skipQuery) > 0 {
+			if len(limitQuery) > 0 {
 				i, err := strconv.ParseInt(limitQuery[0], 10, 64)
 
 				if err != nil {
@@ -211,27 +211,39 @@ func search(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if params.Text != "" {
-			query["$text"] = bson.M{"$search": params.Text}
+			pipe := bson.M{"$match": bson.M{"$text": bson.M{"$search": params.Text}}}
+			sort := bson.M{"$sort": bson.M{"name": 1}}
+			pipes = append(pipes, pipe, sort)
 		}
 
 		if params.Hint != "" {
-			query["name"] = bson.M{"$regex": bson.RegEx{Pattern: "^" + params.Hint, Options: "i"}}
+			pipe := bson.M{"$match": bson.M{"name": bson.M{"$regex": bson.RegEx{Pattern: "^" + params.Hint, Options: "i"}}}}
+			sort := bson.M{"$sort": bson.M{"name": 1}}
+			pipes = append(pipes, pipe, sort)
 		}
 
 		if params.Lon > 0 {
-			query["location"] = bson.M{
-				"$near": bson.M{
-					"$geometry": bson.M{
-						"type":        "Point",
-						"coordinates": []float64{params.Lon, params.Lat},
-					},
-					"$maxDistance": params.LocationScope,
+			pipe := bson.M{
+				"$geoNear": bson.M{
+					"near":          []float64{params.Lon, params.Lat},
+					"distanceField": "distance",
+					"maxDistance":   params.LocationScope,
+					"spherical":     true,
 				},
 			}
+
+			sort := bson.M{"$sort": bson.M{"distance": 1}}
+			pipes = append(pipes, pipe, sort)
 		}
 
+		skip := bson.M{"$skip": params.Skip}
+		limit := bson.M{"$limit": params.Limit}
+		pipes = append(pipes, skip, limit)
+
+		fmt.Println(pipes)
+
 		c := session.DB(os.Getenv("DB_NAME")).C(collection)
-		c.Find(query).Skip(params.Skip).Limit(params.Limit).Sort("name").All(&electricians)
+		c.Pipe(pipes).All(&electricians)
 		electriciansJSON, err := json.Marshal(electricians)
 
 		if err != nil {
