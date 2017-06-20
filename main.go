@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 
+	"strconv"
+
 	"github.com/gorilla/mux"
 	"github.com/stianba/auth-service/token"
 	"gopkg.in/mgo.v2"
@@ -16,9 +18,67 @@ import (
 const collection string = "electricians"
 
 type electrician struct {
-	ID      bson.ObjectId `json:"_id" bson:"_id,omitempty"`
-	Name    string        `json:"name"`
-	Address string        `json:"address"`
+	ID           bson.ObjectId `json:"_id" bson:"_id,omitempty"`
+	Name         string        `json:"name"`
+	AddressLine1 string        `json:"addressLine1" bson:"addressLine1"`
+	AddressLine2 string        `json:"addressLine2" bson:"addressLine2"`
+	City         string        `json:"city"`
+	County       string        `json:"county"`
+	Zip          string        `json:"zip"`
+	Phone        string        `json:"phone"`
+	Location     geo           `json:"location"`
+}
+
+type geo struct {
+	Type        string    `json:"-"`
+	Coordinates []float64 `json:"coordinates"`
+}
+
+type searchParams struct {
+	Skip          int
+	Limit         int
+	Text          string
+	Hint          string
+	Lon           float64
+	Lat           float64
+	LocationScope int
+}
+
+func ensureIndex(s *mgo.Session) {
+	session := s.Copy()
+	defer session.Close()
+
+	c := session.DB(os.Getenv("DB_NAME")).C(collection)
+
+	geoIndex := mgo.Index{
+		Key: []string{"$2dsphere:location"},
+	}
+
+	err := c.EnsureIndex(geoIndex)
+
+	if err != nil {
+		panic(err)
+	}
+
+	textSearchIndex := mgo.Index{
+		Key: []string{"$text:name", "$text:addressLine1", "$text:addressLine2", "$text:city", "$text:county"},
+	}
+
+	err = c.EnsureIndex(textSearchIndex)
+
+	if err != nil {
+		panic(err)
+	}
+
+	hintIndex := mgo.Index{
+		Key: []string{"name"},
+	}
+
+	err = c.EnsureIndex(hintIndex)
+
+	if err != nil {
+		panic(err)
+	}
 }
 
 func errorWithJSON(w http.ResponseWriter, err string, code int) {
@@ -79,15 +139,120 @@ func listAll(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func search(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := s.Copy()
+		defer session.Close()
+
+		var electricians []electrician
+
+		query := make(bson.M, 0)
+		params := searchParams{Skip: 0, Limit: 10, LocationScope: 90000}
+		queries := r.URL.Query()
+
+		skipQuery, ok := queries["skip"]
+
+		if ok {
+			if len(skipQuery) > 0 {
+				i, err := strconv.ParseInt(skipQuery[0], 10, 64)
+
+				if err != nil {
+					panic(err)
+				}
+
+				params.Skip = int(i)
+			}
+		}
+
+		limitQuery, ok := queries["limit"]
+
+		if ok {
+			if len(skipQuery) > 0 {
+				i, err := strconv.ParseInt(limitQuery[0], 10, 64)
+
+				if err != nil {
+					panic(err)
+				}
+
+				params.Limit = int(i)
+			}
+		}
+
+		textQuery, ok := queries["text"]
+
+		if ok {
+			if len(textQuery) > 0 {
+				params.Text = textQuery[0]
+			}
+		}
+
+		hintQuery, ok := queries["hint"]
+
+		if ok {
+			if len(hintQuery) > 0 {
+				params.Hint = hintQuery[0]
+			}
+		}
+
+		lonQuery, ok := queries["lon"]
+
+		if ok {
+			if len(lonQuery) > 0 {
+				params.Lon, _ = strconv.ParseFloat(lonQuery[0], 64)
+			}
+		}
+
+		latQuery, ok := queries["lat"]
+
+		if ok {
+			if len(latQuery) > 0 {
+				params.Lat, _ = strconv.ParseFloat(latQuery[0], 64)
+			}
+		}
+
+		if params.Text != "" {
+			query["$text"] = bson.M{"$search": params.Text}
+		}
+
+		if params.Hint != "" {
+			query["name"] = bson.M{"$regex": bson.RegEx{Pattern: "^" + params.Hint, Options: "i"}}
+		}
+
+		if params.Lon > 0 {
+			query["location"] = bson.M{
+				"$near": bson.M{
+					"$geometry": bson.M{
+						"type":        "Point",
+						"coordinates": []float64{params.Lon, params.Lat},
+					},
+					"$maxDistance": params.LocationScope,
+				},
+			}
+		}
+
+		c := session.DB(os.Getenv("DB_NAME")).C(collection)
+		c.Find(query).Skip(params.Skip).Limit(params.Limit).Sort("name").All(&electricians)
+		electriciansJSON, err := json.Marshal(electricians)
+
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		responseWithJSON(w, electriciansJSON, http.StatusOK)
+	}
+}
+
 func create(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		session := s.Copy()
 		defer session.Close()
 
-		var electrician electrician
+		electrician := electrician{ID: bson.NewObjectId()}
 
 		decoder := json.NewDecoder(r.Body)
 		err := decoder.Decode(&electrician)
+
+		electrician.Location.Type = "Point"
 
 		if err != nil {
 			errorWithJSON(w, "Icorrect body", http.StatusBadRequest)
@@ -143,6 +308,7 @@ func main() {
 
 	defer session.Close()
 	session.SetMode(mgo.Monotonic, true)
+	ensureIndex(session)
 
 	port := os.Getenv("PORT")
 
@@ -152,6 +318,7 @@ func main() {
 
 	router := mux.NewRouter()
 	router.HandleFunc("/", listAll(session)).Methods("GET")
+	router.HandleFunc("/search", search(session)).Methods("GET")
 	router.Handle("/", isAuthenticated(http.HandlerFunc(create(session)))).Methods("POST")
 	router.Handle("/{id}", isAuthenticated(http.HandlerFunc(delete(session)))).Methods("DELETE")
 	http.ListenAndServe(":"+port, router)
